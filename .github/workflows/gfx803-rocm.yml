@@ -1,11 +1,11 @@
-name: build gfx803 image
+name: build rocm6 image
 
 on:
   push:
     branches: [main]
     paths:
-      - Dockerfile
-      - .github/workflows/build.yml
+      - rocm6/**
+      - .github/workflows/rocm6.yml
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: gfx803-image
+  group: rocm6-image
   cancel-in-progress: true
 
 jobs:
@@ -51,9 +51,12 @@ jobs:
       - name: Build and push
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}/rocm6"
           STAMP="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
-          docker build --progress=plain -t "$IMAGE:latest" -t "$IMAGE:$STAMP" .
+          docker build --progress=plain \
+            -f rocm6/Dockerfile \
+            -t "$IMAGE:latest" -t "$IMAGE:$STAMP" \
+            rocm6
           docker push "$IMAGE:latest"
           docker push "$IMAGE:$STAMP"
           {
