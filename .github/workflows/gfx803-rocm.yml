@@ -1,25 +1,20 @@
-name: build gfx803 image -> GHCR
+name: build gfx803 image
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
   workflow_dispatch:
-    inputs:
-      app:
-        description: "What to build on top of the gfx803 ROCm base"
-        type: choice
-        options: [llamacpp, ollama]
-        default: llamacpp
-      max_jobs:
-        description: "Parallel compile jobs (4 vCPU / 16 GB runner: keep at 4)"
-        type: string
-        default: "4"
-      upstream_ref:
-        description: "robertrosenbusch/gfx803_rocm branch / tag / commit (recorded in the image)"
-        type: string
-        default: "main"
 
 permissions:
   contents: read
   packages: write
+
+concurrency:
+  group: gfx803-image
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -53,24 +48,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build ./Dockerfile and push to GHCR
+      - name: Build and push
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          APP="${{ inputs.app }}"
-          T1="$IMAGE:$APP"
-          T2="$IMAGE:$APP-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
-          docker build --progress=plain \
-            --build-arg APP="$APP" \
-            --build-arg MAX_JOBS="${{ inputs.max_jobs }}" \
-            --build-arg UPSTREAM_REF="${{ inputs.upstream_ref }}" \
-            -t "$T1" -t "$T2" .
-          docker push "$T1"
-          docker push "$T2"
+          STAMP="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          docker build --progress=plain -t "$IMAGE:latest" -t "$IMAGE:$STAMP" .
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:$STAMP"
           {
             echo "### Pushed"
-            echo "- \`$T1\`"
-            echo "- \`$T2\`"
+            echo "- \`$IMAGE:latest\`"
+            echo "- \`$IMAGE:$STAMP\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Disk usage
