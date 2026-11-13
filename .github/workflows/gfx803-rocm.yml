@@ -1,333 +1,80 @@
-name: gfx803 ROCm -> GHCR
+name: build gfx803 image -> GHCR
 
 on:
   workflow_dispatch:
     inputs:
-      targets:
-        description: "Comma separated: base,llamacpp,ollama,pytorch,comfyui,whisperx"
+      app:
+        description: "What to build on top of the gfx803 ROCm base"
+        type: choice
+        options: [llamacpp, ollama]
+        default: llamacpp
+      max_jobs:
+        description: "Parallel compile jobs (4 vCPU / 16 GB runner: keep at 4)"
         type: string
-        default: "base,llamacpp"
-      runner:
-        description: "Runner label. Use a self-hosted label for pytorch/comfyui/whisperx"
-        type: string
-        default: "ubuntu-24.04"
+        default: "4"
       upstream_ref:
-        description: "Branch / tag / commit of robertrosenbusch/gfx803_rocm"
+        description: "robertrosenbusch/gfx803_rocm branch / tag / commit (recorded in the image)"
         type: string
         default: "main"
-      max_jobs:
-        description: "Compile jobs override (blank = per-target default). 4 vCPU/16GB: <=4, torch <=2"
-        type: string
-        default: ""
-      rebuild_base:
-        description: "Rebuild base even if it already exists on GHCR"
-        type: boolean
-        default: false
-      use_registry_cache:
-        description: "Reuse published image as BuildKit inline cache (extra disk + pull time)"
-        type: boolean
-        default: false
-      cleanup:
-        description: "Free disk + move Docker storage to /mnt (GitHub-hosted only; disable on self-hosted)"
-        type: boolean
-        default: true
-      push:
-        description: "Push images to GHCR"
-        type: boolean
-        default: true
 
 permissions:
   contents: read
   packages: write
 
-env:
-  UPSTREAM_REPO: https://github.com/robertrosenbusch/gfx803_rocm.git
-  DOCKER_BUILDKIT: "1"
-
-concurrency:
-  group: gfx803-${{ github.ref }}-${{ inputs.targets }}
-  cancel-in-progress: false
-
 jobs:
-  plan:
+  build:
     runs-on: ubuntu-24.04
-    outputs:
-      prefix: ${{ steps.plan.outputs.prefix }}
-      stamp: ${{ steps.plan.outputs.stamp }}
-      upstream_sha: ${{ steps.plan.outputs.upstream_sha }}
-      apps_matrix: ${{ steps.plan.outputs.apps_matrix }}
-      has_apps: ${{ steps.plan.outputs.has_apps }}
-      build_base: ${{ steps.plan.outputs.build_base }}
+    timeout-minutes: 350
     steps:
-      - name: Resolve upstream commit and build plan
-        id: plan
-        env:
-          TARGETS: ${{ inputs.targets }}
-          UPSTREAM_REF: ${{ inputs.upstream_ref }}
-          MAX_JOBS_OVERRIDE: ${{ inputs.max_jobs }}
-        run: |
-          set -euo pipefail
-          git clone --quiet "$UPSTREAM_REPO" upstream
-          git -C upstream checkout --quiet --detach "$UPSTREAM_REF"
-          export SHA="$(git -C upstream rev-parse HEAD)"
-          export PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
-          export STAMP="$(date -u +%Y%m%d)-${SHA:0:7}"
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os
-          # target: (dockerfile, tag, default compile jobs, job timeout minutes)
-          catalog = {
-              "base":     ("Dockerfile_rocm64_base",     "6.4",    4, 300),
-              "llamacpp": ("Dockerfile_rocm64_llamacpp", "latest", 4, 240),
-              "ollama":   ("Dockerfile_rocm64_ollama",   "0.9.0",  4, 330),
-              "pytorch":  ("Dockerfile_rocm64_pytorch",  "2.6",    2, 350),
-              "comfyui":  ("Dockerfile_rocm64_comfyui",  "latest", 2, 350),
-              "whisperx": ("Dockerfile_rocm64_whisperx", "latest", 2, 350),
-          }
-          want = [t.strip() for t in os.environ["TARGETS"].split(",") if t.strip()]
-          bad = [t for t in want if t not in catalog]
-          if bad:
-              raise SystemExit("unknown target(s) %s; allowed: %s" % (bad, list(catalog)))
-          ov = os.environ.get("MAX_JOBS_OVERRIDE", "").strip()
-          apps = []
-          for t in want:
-              if t == "base":
-                  continue
-              df, tag, jobs, tmo = catalog[t]
-              apps.append({"target": t, "dockerfile": df, "tag": tag,
-                           "jobs": int(ov) if ov else jobs, "timeout": tmo})
-          print("prefix=" + os.environ["PREFIX"])
-          print("stamp=" + os.environ["STAMP"])
-          print("upstream_sha=" + os.environ["SHA"])
-          print("build_base=" + ("true" if ("base" in want or apps) else "false"))
-          print("has_apps=" + ("true" if apps else "false"))
-          print("apps_matrix=" + json.dumps({"include": apps}))
-          PY
+      - uses: actions/checkout@v7
 
-  base:
-    needs: plan
-    if: needs.plan.outputs.build_base == 'true'
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 300
-    env:
-      BASE_REF: ${{ needs.plan.outputs.prefix }}/base:6.4
-      BASE_STAMP: ${{ needs.plan.outputs.prefix }}/base:6.4-${{ needs.plan.outputs.stamp }}
-      JOBS: ${{ inputs.max_jobs != '' && inputs.max_jobs || '4' }}
-    steps:
-      - name: Free disk space (GitHub-hosted)
-        if: ${{ inputs.cleanup }}
+      - name: Free disk space and move Docker onto the big ephemeral disk
         run: |
           set -x
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/.ghcup \
                       /opt/hostedtoolcache/CodeQL /usr/share/swift /opt/az || true
           sudo apt-get clean || true
           docker image prune --all --force || true
-          df -h / /mnt || true
-
-      - name: Move Docker storage to the big ephemeral disk (GitHub-hosted)
-        if: ${{ inputs.cleanup }}
-        run: |
-          set -euo pipefail
-          if ! mountpoint -q /mnt; then
-            echo "::warning::/mnt is not a separate disk on this runner - only the root FS is available"
-            exit 0
-          fi
-          sudo systemctl stop docker.socket docker containerd || true
-          for d in docker containerd; do
-            sudo mkdir -p "/mnt/$d" "/var/lib/$d"
-            sudo mount --bind "/mnt/$d" "/var/lib/$d"
-          done
-          sudo systemctl start containerd docker
-          docker info --format 'DockerRootDir={{.DockerRootDir}}'
-          df -h / /mnt
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Do we already have this base image?
-        id: have
-        run: |
-          set -euo pipefail
-          if [ "${{ inputs.rebuild_base }}" != "true" ] && docker manifest inspect "$BASE_REF" >/dev/null 2>&1; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Base image already published: $BASE_REF (set rebuild_base=true to force)"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Fetch upstream Dockerfiles
-        if: steps.have.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          git clone "$UPSTREAM_REPO" upstream
-          git -C upstream checkout --detach "${{ needs.plan.outputs.upstream_sha }}"
-          # MAX_JOBS is an ENV (not an ARG) upstream and defaults to 14 -> OOM on a 16 GB runner.
-          sed -i -E "s/^([[:space:]]*)MAX_JOBS=[0-9]+/\1MAX_JOBS=${JOBS}/" upstream/Dockerfile_rocm64_base
-          grep -n "MAX_JOBS" upstream/Dockerfile_rocm64_base | head -3
-
-      - name: Build base (rocBLAS for gfx803)
-        if: steps.have.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          CACHE=()
-          if [ "${{ inputs.use_registry_cache }}" = "true" ]; then
-            CACHE=(--build-arg BUILDKIT_INLINE_CACHE=1 --cache-from "$BASE_REF")
-          fi
-          docker build --progress=plain "${CACHE[@]}" \
-            -f upstream/Dockerfile_rocm64_base \
-            -t "$BASE_REF" -t "$BASE_STAMP" -t rocm6_gfx803_base:6.4 \
-            upstream
-
-      - name: Smoke test - did rocBLAS really produce gfx803 kernels?
-        if: steps.have.outputs.skip != 'true'
-        continue-on-error: true
-        run: |
-          docker run --rm --entrypoint /bin/bash "$BASE_REF" -lc '
-            set -e
-            n=$(ls /opt/rocm/lib/rocblas/library/ | grep -c gfx803 || true)
-            echo "gfx803 rocBLAS objects: $n"
-            test "$n" -gt 0
-          ' || echo "::warning::no gfx803 objects found in rocBLAS library dir - inspect the image before using it"
-
-      - name: Push base
-        if: ${{ inputs.push && steps.have.outputs.skip != 'true' }}
-        run: |
-          set -euo pipefail
-          docker push "$BASE_REF"
-          docker push "$BASE_STAMP"
-
-      - name: Summary
-        if: always()
-        run: |
-          {
-            echo "### base"
-            echo "- \`$BASE_REF\`"
-            echo "- \`$BASE_STAMP\`"
-            echo "- upstream: \`${{ needs.plan.outputs.upstream_sha }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          df -h / /mnt || true
-          docker system df || true
-
-  apps:
-    needs: [plan, base]
-    if: >-
-      always() &&
-      needs.plan.result == 'success' &&
-      needs.plan.outputs.has_apps == 'true' &&
-      (needs.base.result == 'success' || needs.base.result == 'skipped')
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix: ${{ fromJSON(needs.plan.outputs.apps_matrix) }}
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: ${{ matrix.timeout }}
-    env:
-      BASE_REF: ${{ needs.plan.outputs.prefix }}/base:6.4
-      IMAGE_REF: ${{ needs.plan.outputs.prefix }}/${{ matrix.target }}:${{ matrix.tag }}
-      IMAGE_STAMP: ${{ needs.plan.outputs.prefix }}/${{ matrix.target }}:${{ matrix.tag }}-${{ needs.plan.outputs.stamp }}
-    steps:
-      - name: Free disk space (GitHub-hosted)
-        if: ${{ inputs.cleanup }}
-        run: |
-          set -x
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/.ghcup \
-                      /opt/hostedtoolcache/CodeQL /usr/share/swift /opt/az || true
-          sudo apt-get clean || true
-          docker image prune --all --force || true
-          df -h / /mnt || true
-
-      - name: Move Docker storage to the big ephemeral disk (GitHub-hosted)
-        if: ${{ inputs.cleanup }}
-        run: |
-          set -euo pipefail
-          if ! mountpoint -q /mnt; then
-            echo "::warning::/mnt is not a separate disk on this runner - only the root FS is available"
-            exit 0
-          fi
-          sudo systemctl stop docker.socket docker containerd || true
-          for d in docker containerd; do
-            sudo mkdir -p "/mnt/$d" "/var/lib/$d"
-            sudo mount --bind "/mnt/$d" "/var/lib/$d"
-          done
-          sudo systemctl start containerd docker
-          df -h / /mnt
-
-      - name: Extra swap for the PyTorch link step
-        if: ${{ inputs.cleanup && (matrix.target == 'pytorch' || matrix.target == 'comfyui' || matrix.target == 'whisperx') }}
-        run: |
           if mountpoint -q /mnt; then
-            sudo fallocate -l 8G /mnt/extra-swap && sudo chmod 600 /mnt/extra-swap \
-              && sudo mkswap /mnt/extra-swap && sudo swapon /mnt/extra-swap \
-              || echo "::warning::could not add swap"
+            sudo systemctl stop docker.socket docker containerd || true
+            for d in docker containerd; do
+              sudo mkdir -p "/mnt/$d" "/var/lib/$d"
+              sudo mount --bind "/mnt/$d" "/var/lib/$d"
+            done
+            sudo systemctl start containerd docker
+          else
+            echo "::warning::no separate /mnt disk on this runner - the build may run out of space"
           fi
-          free -h
+          df -h / /mnt || true
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull the gfx803 base and give it the name the upstream FROM expects
+      - name: Build ./Dockerfile and push to GHCR
         run: |
           set -euo pipefail
-          docker pull "$BASE_REF"
-          docker tag "$BASE_REF" rocm6_gfx803_base:6.4
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          APP="${{ inputs.app }}"
+          T1="$IMAGE:$APP"
+          T2="$IMAGE:$APP-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          docker build --progress=plain \
+            --build-arg APP="$APP" \
+            --build-arg MAX_JOBS="${{ inputs.max_jobs }}" \
+            --build-arg UPSTREAM_REF="${{ inputs.upstream_ref }}" \
+            -t "$T1" -t "$T2" .
+          docker push "$T1"
+          docker push "$T2"
+          {
+            echo "### Pushed"
+            echo "- \`$T1\`"
+            echo "- \`$T2\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fetch upstream Dockerfiles
-        run: |
-          set -euo pipefail
-          git clone "$UPSTREAM_REPO" upstream
-          git -C upstream checkout --detach "${{ needs.plan.outputs.upstream_sha }}"
-          # keep the upstream FROM untouched; only cap the compile parallelism
-          sed -i "/^FROM /a ENV MAX_JOBS=${{ matrix.jobs }}" "upstream/${{ matrix.dockerfile }}"
-          head -12 "upstream/${{ matrix.dockerfile }}"
-
-      - name: Build ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          CACHE=()
-          if [ "${{ inputs.use_registry_cache }}" = "true" ]; then
-            CACHE=(--build-arg BUILDKIT_INLINE_CACHE=1 --cache-from "$IMAGE_REF")
-          fi
-          docker build --progress=plain "${CACHE[@]}" \
-            -f "upstream/${{ matrix.dockerfile }}" \
-            -t "$IMAGE_REF" -t "$IMAGE_STAMP" \
-            upstream
-
-      - name: Smoke test (no GPU on the runner, so only static checks)
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          case "${{ matrix.target }}" in
-            llamacpp) CHECK='test -x /llama.cpp/build/bin/llama-cli' ;;
-            ollama)   CHECK='test -x /ollama/ollama && /ollama/ollama --version' ;;
-            pytorch)  CHECK='ls /pytorch/dist/*.whl && python3 -c "import torch;print(torch.__version__, torch.version.hip)"' ;;
-            comfyui)  CHECK='/ComfyUI/venv/bin/python -c "import torch;print(torch.__version__)"' ;;
-            whisperx) CHECK='/Whisper-WebUI/venv/bin/python -c "import torch;print(torch.__version__)"' ;;
-          esac
-          docker run --rm --entrypoint /bin/bash "$IMAGE_REF" -lc "$CHECK" \
-            || echo "::warning::smoke test failed for ${{ matrix.target }} - image was still pushed, inspect it"
-
-      - name: Push ${{ matrix.target }}
-        if: ${{ inputs.push }}
-        run: |
-          set -euo pipefail
-          docker push "$IMAGE_REF"
-          docker push "$IMAGE_STAMP"
-
-      - name: Summary
+      - name: Disk usage
         if: always()
         run: |
-          {
-            echo "### ${{ matrix.target }}"
-            echo "- \`$IMAGE_REF\`"
-            echo "- \`$IMAGE_STAMP\`"
-            echo "- upstream: \`${{ needs.plan.outputs.upstream_sha }}\`, MAX_JOBS=${{ matrix.jobs }}"
-          } >> "$GITHUB_STEP_SUMMARY"
           df -h / /mnt || true
           docker system df || true
